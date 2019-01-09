@@ -1,4 +1,4 @@
-{ yarn2nix }:
+{ yarn2nix ? import ../../. {} }:
 
 yarn2nix.mkYarnWorkspace {
   src = ./.;

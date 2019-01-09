@@ -54,7 +54,6 @@ in rec {
     "--offline"
     "--frozen-lockfile"
     "--ignore-engines"
-    "--ignore-scripts"
   ];
 
   mkYarnModules = {
@@ -68,6 +67,7 @@ in rec {
     pkgConfig ? {},
     preBuild ? "",
     workspaceDependencies ? [],
+    nohoist ? []
   }:
     let
       offlineCache = importOfflineCache yarnNix;
@@ -86,7 +86,13 @@ in rec {
       ) (builtins.attrNames pkgConfig));
       workspaceJSON = pkgs.writeText
         "${name}-workspace-package.json"
-        (builtins.toJSON { private = true; workspaces = ["deps/**"]; }); # scoped packages need second splat
+        (builtins.toJSON {
+          private = true;
+          workspaces = {
+            inherit nohoist;
+            packages = ["deps/**"];
+          };  
+        }); # scoped packages need second splat
       workspaceDependencyLinks = lib.concatMapStringsSep "\n"
         (dep: ''
           mkdir -p "deps/${dep.pname}"
@@ -112,6 +118,7 @@ in rec {
         cp ${yarnLock} ./yarn.lock
         chmod +w ./yarn.lock
 
+        yarn config --offline set nodedir "${nodejs}/include/node"
         yarn config --offline set yarn-offline-mirror ${offlineCache}
 
         # Do not look up in the registry, but in the offline cache.
@@ -127,19 +134,12 @@ in rec {
         mv node_modules $out/
         mv deps $out/
         patchShebangs $out
+
+        runHook postBuild
       '';
+
+      passthru.offlineCache = offlineCache;
     };
-
-  # This can be used as a shellHook in mkYarnPackage. It brings the built node_modules into
-  # the shell-hook environment.
-  linkNodeModulesHook = ''
-    if [[ -d node_modules || -L node_modules ]]; then
-      echo "./node_modules is present. Replacing."
-      rm -rf node_modules
-    fi
-
-    ln -s "$node_modules" node_modules
-  '';
 
   mkYarnWorkspace = {
     src,
@@ -184,154 +184,247 @@ in rec {
   in packages;
 
   mkYarnPackage = {
-    name ? null,
+    # Run-time dependencies for the package
+    buildInputs ? [],
+
+    # Execute before shell hook
+    preShellHook ? "",
+
+    # Execute after shell hook
+    postShellHook ? "",
+
+    # package source
     src,
+
+    # packageJSON file
     packageJSON ? src + "/package.json",
+
+    # package
+    package ? lib.importJSON packageJSON,
+
+    # name to use for a package (default "${pname}-${version}")
+    name ? null,
+
+    # name of the package
+    pname ? package.name,
+
+    # version of the package
+    version ? package.version,
+
+    # yarn lock file (optional)
     yarnLock ? src + "/yarn.lock",
+
+    # yarnNix file
     yarnNix ? mkYarnNix { inherit yarnLock; },
+
+    # yarnFlags to pass to yarn
     yarnFlags ? defaultYarnFlags,
+
+    # extra yarn flags to pass to yarn
+    extraYarnFlags ? [],
+
+    # yarn pre build
     yarnPreBuild ? "",
     pkgConfig ? {},
-    extraBuildInputs ? [],
-    publishBinsFor ? null,
+
+    # list of package names to publish binaries for
+    publishBinsFor ? [pname],
+
+    # whether to install only production modules when releasing package
+    useProduction ? lib.hasAttr "devDependencies" package && package.devDependencies != [],
+
+    # extra package dependencies
     workspaceDependencies ? [],
+
     ...
-  }@attrs:
-    let
-      package = lib.importJSON packageJSON;
-      pname = package.name;
-      safeName = reformatPackageName pname;
-      version = package.version;
-      baseName = unlessNull name "${safeName}-${version}";
-      deps = mkYarnModules {
-        name = "${safeName}-modules-${version}";
-        preBuild = yarnPreBuild;
-        workspaceDependencies = workspaceDependenciesTransitive;
-        inherit packageJSON pname version yarnLock yarnNix yarnFlags pkgConfig;
-      };
-      publishBinsFor_ = unlessNull publishBinsFor [pname];
-      linkDirFunction = ''
-        linkDirToDirLinks() {
-          target=$1
-          if [ ! -f "$target" ]; then
-            mkdir -p "$target"
-          elif [ -L "$target" ]; then
-            local new=$(mktemp -d)
-            trueSource=$(realpath "$target")
-            if [ "$(ls $trueSource | wc -l)" -gt 0 ]; then
-              ln -s $trueSource/* $new/
-            fi
-            rm -r "$target"
-            mv "$new" "$target"
+  }@attrs: let
+    safeName = reformatPackageName pname;
+    baseName = unlessNull name "${safeName}-${version}";
+
+    deps = mkYarnModules {
+      name = "${safeName}-modules-${version}";
+      preBuild = yarnPreBuild;
+      workspaceDependencies = workspaceDependenciesTransitive;
+      yarnFlags = yarnFlags ++ extraYarnFlags;
+      inherit packageJSON pname version yarnLock yarnNix pkgConfig;
+    };
+
+    prodDeps = mkYarnModules {
+      name = "${safeName}-modules-production-${version}";
+      preBuild = yarnPreBuild;
+      workspaceDependencies = workspaceDependenciesTransitive;
+      yarnFlags = yarnFlags ++ extraYarnFlags ++ ["--production"];
+      inherit packageJSON pname version yarnLock yarnNix pkgConfig;
+    };
+
+    linkDirFunction = ''
+      linkDirToDirLinks() {
+        target=$1
+        if [ ! -f "$target" ]; then
+          mkdir -p "$target"
+        elif [ -L "$target" ]; then
+          local new=$(mktemp -d)
+          trueSource=$(realpath "$target")
+          if [ "$(ls $trueSource | wc -l)" -gt 0 ]; then
+            ln -s $trueSource/* $new/
           fi
-        }
-      '';
-      workspaceDependenciesTransitive = lib.unique ((lib.flatten (builtins.map (dep: dep.workspaceDependencies) workspaceDependencies)) ++ workspaceDependencies);
-      workspaceDependencyCopy = lib.concatMapStringsSep "\n"
-        (dep: ''
-          # ensure any existing scope directory is not a symlink
-          linkDirToDirLinks "$(dirname node_modules/${dep.pname})"
-          mkdir -p "deps/${dep.pname}"
-          tar -xf "${dep}/tarballs/${dep.name}.tgz" --directory "deps/${dep.pname}" --strip-components=1
-          if [ ! -e "deps/${dep.pname}/node_modules" ]; then
-            ln -s "${deps}/deps/${dep.pname}/node_modules" "deps/${dep.pname}/node_modules"
-          fi
-        '')
-        workspaceDependenciesTransitive;
-    in stdenv.mkDerivation (builtins.removeAttrs attrs ["pkgConfig" "workspaceDependencies"] // {
-      inherit src;
+          rm -r "$target"
+          mv "$new" "$target"
+        fi
+      }
+    '';
 
-      name = baseName;
+    workspaceDependenciesTransitive = lib.unique ((lib.flatten (builtins.map (dep: dep.workspaceDependencies) workspaceDependencies)) ++ workspaceDependencies);
 
-      buildInputs = [ yarn nodejs ] ++ extraBuildInputs;
+    workspaceDependencyCopy = lib.concatMapStringsSep "\n" (dep: ''
+      # ensure any existing scope directory is not a symlink
+      linkDirToDirLinks "$(dirname node_modules/${dep.pname})"
+      mkdir -p "deps/${dep.pname}"
+      tar -xf "${dep.dist}/tarballs/${dep.name}.tgz" --directory "deps/${dep.pname}" --strip-components=1
+      if [ ! -e "deps/${dep.pname}/node_modules" ]; then
+        ln -s "${deps}/deps/${dep.pname}/node_modules" "deps/${dep.pname}/node_modules"
+      fi
+    '') workspaceDependenciesTransitive;
 
-      node_modules = deps + "/node_modules";
+    withoutAttrs = ["pkgConfig" "workspaceDependencies" "package"];
+  in stdenv.mkDerivation (builtins.removeAttrs attrs withoutAttrs // {
+    inherit src version;
 
-      configurePhase = attrs.configurePhase or ''
-        runHook preConfigure
+    name = baseName;
 
-        for localDir in npm-packages-offline-cache node_modules; do
-          if [[ -d $localDir || -L $localDir ]]; then
-            echo "$localDir dir present. Removing."
-            rm -rf $localDir
-          fi
-        done
+    buildInputs = [ yarn nodejs ] ++ buildInputs;
 
-        mkdir -p "deps/${pname}"
-        shopt -s extglob
-        cp -r !(deps) "deps/${pname}"
-        shopt -u extglob
-        ln -s ${deps}/deps/${pname}/node_modules "deps/${pname}/node_modules"
+    node_modules = deps + "/node_modules";
 
-        cp -r $node_modules node_modules
-        chmod -R +w node_modules
+    prod_node_modules =
+      if useProduction then prodDeps + "/node_modules"
+      else deps + "/node_modules";
 
-        ${linkDirFunction}
-        linkDirToDirLinks "$(dirname node_modules/${pname})"
-        ln -s "deps/${pname}" "node_modules/${pname}"
-        ${workspaceDependencyCopy}
+    outputs = ["out" "dist"];
 
-        # Help yarn commands run in other phases find the package
-        echo "--cwd deps/${pname}" > .yarnrc
-        runHook postConfigure
-      '';
+    configurePhase = attrs.configurePhase or ''
+      runHook preConfigure
 
-      # Replace this phase on frontend packages where only the generated
-      # files are an interesting output.
-      installPhase = attrs.installPhase or ''
-        runHook preInstall
+      ${linkDirFunction}
 
-        mkdir -p $out/{bin,libexec/${pname}}
-        mv node_modules $out/libexec/${pname}/node_modules
-        mv deps $out/libexec/${pname}/deps
-        node ${./internal/fixup_bin.js} $out/bin $out/libexec/${pname}/node_modules ${lib.concatStringsSep " " publishBinsFor_}
+      # remove existing npm-packages-offline-cache and node_modules
+      for localDir in npm-packages-offline-cache node_modules; do
+        if [[ -d $localDir || -L $localDir ]]; then
+          echo "$localDir dir present. Removing."
+          rm -rf $localDir
+        fi
+      done
 
-        runHook postInstall
-      '';
+      mkdir -p "deps/${pname}"
+      shopt -s extglob
+      cp -r {!(deps),.[^.]*} "deps/${pname}"
+      shopt -u extglob
+      ln -s ${deps}/deps/${pname}/node_modules "deps/${pname}/node_modules"
 
-      doDist = true;
-      distPhase = attrs.distPhase or ''
-        # pack command ignores cwd option
-        rm -f .yarnrc
-        cd $out/libexec/${pname}/deps/${pname}
-        mkdir -p $out/tarballs/
-        yarn pack --offline --ignore-scripts --filename $out/tarballs/${baseName}.tgz
-      '';
+      # copy node_modules locally
+      cp -r $node_modules node_modules
+      chmod -R +w node_modules
 
-      passthru = {
-        inherit pname package packageJSON deps;
-        workspaceDependencies = workspaceDependenciesTransitive;
-      } // (attrs.passthru or {});
+      linkDirToDirLinks "$(dirname node_modules/${pname})"
+      ln -s "deps/${pname}" "node_modules/${pname}"
 
-      meta = {
-        inherit (nodejs.meta) platforms;
-        description = packageJSON.description or "";
-        homepage = packageJSON.homepage or "";
-        version = packageJSON.version or "";
-        license = if packageJSON ? license then spdxLicense packageJSON.license else "";
-      } // (attrs.meta or {});
-    });
+      ${workspaceDependencyCopy}
+
+      # Help yarn commands run in other phases find the package
+      echo "--cwd deps/${pname}" > .yarnrc
+
+      runHook postConfigure
+    '';
+
+    # Replace this phase on frontend packages where only the generated
+    # files are an interesting output.
+    installPhase = attrs.installPhase or ''
+      runHook preInstall
+
+      mkdir -p $out/{bin,libexec/${pname}}
+
+      rm "deps/${pname}/node_modules"
+      ${if useProduction then ''
+      cp -r $prod_node_modules $out/libexec/${pname}/node_modules
+      chmod -R +w $out/libexec/${pname}/node_modules
+
+      if [ -d "${prodDeps}/deps/${pname}/node_modules" ]; then
+        cp -R ${prodDeps}/deps/${pname}/node_modules "deps/${pname}"
+        chmod -R +w "deps/${pname}/node_modules"
+      fi
+      '' else ''
+      mv node_modules $out/libexec/${pname}/node_modules
+
+      if [ -d "${deps}/deps/${pname}/node_modules" ]; then
+        cp -R ${deps}/deps/${pname}/node_modules "deps/${pname}"
+        chmod -R +w "deps/${pname}/node_modules"
+      ff
+      ''}
+
+      mv deps $out/libexec/${pname}/deps
+      node ${./internal/fixup_bin.js} $out/bin $out/libexec/${pname}/node_modules ${lib.concatStringsSep " " publishBinsFor}
+
+      runHook postInstall
+    '';
+
+    doDist = true;
+    doCheck = attrs.doCheck or true;
+
+    distPhase = attrs.distPhase or ''
+      # pack command ignores cwd option
+      rm -f .yarnrc
+      cd $out/libexec/${pname}/deps/${pname}
+      mkdir -p $dist/tarballs/
+      yarn pack --offline --ignore-scripts --filename $dist/tarballs/${baseName}.tgz
+    '';
+
+    shellHook = attrs.shellHook or ''
+      ${preShellHook}
+
+      HOME=$PWD yarn config --offline set nodedir "${nodejs}/include/node"
+      yarn install
+
+      ${postShellHook}
+    '';
+
+    passthru = {
+      inherit pname package packageJSON deps;
+      workspaceDependencies = workspaceDependenciesTransitive;
+      offlineCache = deps.offlineCache;
+    } // (attrs.passthru or {});
+
+    meta = {
+      inherit (nodejs.meta) platforms;
+      description = packageJSON.description or "";
+      homepage = packageJSON.homepage or "";
+      version = packageJSON.version or "";
+      license = if packageJSON ? license then spdxLicense packageJSON.license else "";
+    } // (attrs.meta or {});
+  });
 
   yarn2nix = mkYarnPackage {
-    src = ./.;
+    src = lib.cleanSourceWith {
+      filter = name: type: let baseName = baseNameOf (toString name); in !(
+        lib.hasSuffix ".nix" baseName
+      );
+      src = lib.cleanSource ./.;
+    };
 
     # yarn2nix is the only package that requires the yarnNix option.
     # All the other projects can auto-generate that file.
     yarnNix = ./yarn.nix;
+    yarnLock = ./yarn.lock;
+    packageJSON = ./package.json;
 
-    yarnFlags = defaultYarnFlags ++ ["--production=true"];
+    checkPhase = ''
+      yarn run lint
 
-    buildPhase = ''
       ${import ./nix/testFileShFunctions.nix}
 
       testFilePresent ./node_modules/.yarn-integrity
 
       # check dependencies are installed
       testFilePresent ./node_modules/@yarnpkg/lockfile/package.json
-
-      # check devDependencies are not installed
-      testFileOrDirAbsent ./node_modules/.bin/eslint
-      testFileOrDirAbsent ./node_modules/eslint/package.json
     '';
   };
 }
